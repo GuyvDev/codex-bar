@@ -22,7 +22,7 @@ class LiveQuotaState @Inject constructor(private val prefs: EncryptedPrefsManage
             values[key] = when (result) {
                 is Result.Success -> AccountReading(account, result.value)
                 is Result.Failure -> AccountReading(account, previous?.quota, when (result.error) {
-                    is AppError.AuthError -> "Reconnect this account"
+                    is AppError.AuthError -> if (result.error.isTerminal) "Reconnect this account" else "Provider refused update; account retained, retry later"
                     is AppError.RateLimited -> "Provider rate limit; waiting before retry"
                     else -> "Update failed; last successful reading retained"
                 })

@@ -321,6 +321,77 @@ class ClaudeRepositoryImplTest {
         assertTrue(!error.message.contains("offset"))
     }
 
+    @Test fun `temporary renewal failure keeps credential and recovers on next fetch`() = runTest {
+        var current = testAccount(testCredential.copy(expiresAt = java.time.Instant.EPOCH))
+        org.mockito.Mockito.doAnswer { current }.`when`(prefsManager).loadCredentialAccount(AiService.CLAUDE, current.id)
+        `when`(prefsManager.saveRefreshed(anyArg(), anyArg())).thenAnswer { invocation ->
+            current = current.copy(credential = invocation.getArgument<Credential>(1)); true
+        }
+        mockWebServer.enqueue(MockResponse().setResponseCode(503))
+        assertEquals(AppError.ServiceUnavailable, (repository.fetchQuota() as Result.Failure).error)
+        assertEquals("test-refresh-token", current.credential.refreshToken)
+        mockWebServer.enqueue(MockResponse().setBody("""{"access_token":"renewed","refresh_token":"rotated","expires_in":3600}"""))
+        mockWebServer.enqueue(MockResponse().setBody("""{"five_hour":{"utilization":25}}"""))
+        assertTrue(repository.fetchQuota() is Result.Success)
+        assertEquals("rotated", current.credential.refreshToken)
+        org.mockito.Mockito.verify(prefsManager, org.mockito.Mockito.never()).deleteCredential(AiService.CLAUDE)
+        assertEquals(3, mockWebServer.requestCount)
+    }
+
+    @Test fun `renewal rate limit is not a request to sign in again`() = runTest {
+        `when`(prefsManager.loadCredentialAccounts(AiService.CLAUDE)).thenReturn(listOf(testAccount(testCredential.copy(expiresAt = java.time.Instant.EPOCH))))
+        mockWebServer.enqueue(MockResponse().setResponseCode(429))
+        assertEquals(AppError.RateLimited, (repository.fetchQuota() as Result.Failure).error)
+    }
+
+    @Test fun `renewed token followed by usage rate limit remains nonterminal`() = runTest {
+        mockWebServer.enqueue(MockResponse().setResponseCode(401))
+        mockWebServer.enqueue(MockResponse().setBody("""{"access_token":"renewed","expires_in":3600}"""))
+        mockWebServer.enqueue(MockResponse().setResponseCode(429))
+        assertEquals(AppError.RateLimited, (repository.fetchQuota() as Result.Failure).error)
+        assertEquals(3, mockWebServer.requestCount)
+    }
+
+    @Test fun `provider usage refusal preserves account and includes status safely`() = runTest {
+        mockWebServer.enqueue(MockResponse().setResponseCode(403).setBody("private-server-response-marker"))
+        val error = (repository.fetchQuota() as Result.Failure).error as AppError.AuthError
+        assertTrue(!error.isTerminal)
+        assertTrue(error.message.contains("403"))
+        assertTrue(!error.message.contains("private-server-response-marker"))
+        assertEquals(1, mockWebServer.requestCount)
+    }
+
+    @Test fun `invalid grant explicitly requires new login`() = runTest {
+        `when`(prefsManager.loadCredentialAccounts(AiService.CLAUDE)).thenReturn(listOf(testAccount(testCredential.copy(expiresAt = java.time.Instant.EPOCH))))
+        mockWebServer.enqueue(MockResponse().setResponseCode(400).setBody("""{"error":"invalid_grant","error_description":"private-server-response-marker"}"""))
+        val error = (repository.fetchQuota() as Result.Failure).error as AppError.AuthError
+        assertTrue(error.isTerminal)
+        assertTrue(!error.message.contains("private-server-response-marker"))
+    }
+
+    @Test fun `HTML during renewal does not establish invalid grant`() = runTest {
+        `when`(prefsManager.loadCredentialAccounts(AiService.CLAUDE)).thenReturn(listOf(testAccount(testCredential.copy(expiresAt = java.time.Instant.EPOCH))))
+        mockWebServer.enqueue(MockResponse().setResponseCode(400).setBody("<html>invalid_grant</html>"))
+        val error = (repository.fetchQuota() as Result.Failure).error as AppError.AuthError
+        assertTrue(!error.isTerminal)
+    }
+
+    @Test fun `renewal forbidden by provider is nonterminal`() = runTest {
+        `when`(prefsManager.loadCredentialAccounts(AiService.CLAUDE)).thenReturn(listOf(testAccount(testCredential.copy(expiresAt = java.time.Instant.EPOCH))))
+        mockWebServer.enqueue(MockResponse().setResponseCode(403).setBody("<html>browser challenge</html>"))
+        val error = (repository.fetchQuota() as Result.Failure).error as AppError.AuthError
+        assertTrue(!error.isTerminal)
+        assertTrue(error.message.contains("renewal"))
+    }
+
+    @Test fun `renewed access token rejected with 401 requires login`() = runTest {
+        mockWebServer.enqueue(MockResponse().setResponseCode(401))
+        mockWebServer.enqueue(MockResponse().setBody("""{"access_token":"renewed","expires_in":3600}"""))
+        mockWebServer.enqueue(MockResponse().setResponseCode(401))
+        val error = (repository.fetchQuota() as Result.Failure).error as AppError.AuthError
+        assertTrue(error.isTerminal)
+    }
+
     private fun testAccount(credential: Credential.ClaudeCredential): CredentialAccount {
         return CredentialAccount(
             id = "claude-test",

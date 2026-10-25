@@ -16,6 +16,9 @@ import com.codexbar.android.core.security.EncryptedPrefsManager
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
+import kotlinx.coroutines.CancellationException
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
 import java.io.IOException
 import java.time.Instant
 import javax.inject.Inject
@@ -44,8 +47,10 @@ class ClaudeRepositoryImpl @Inject constructor(
         val credential = account.credential as? Credential.ClaudeCredential
             ?: return Result.Failure(AppError.CredentialNotFound(AiService.CLAUDE))
 
-        val workingCredential = ensureValidToken(account, credential)
-            ?: return Result.Failure(AppError.AuthError(AiService.CLAUDE, isTerminal = true))
+        val workingCredential = when (val valid = ensureValidToken(account, credential)) {
+            is Result.Success -> valid.value
+            is Result.Failure -> return valid
+        }
 
         return try {
             val response = apiService.getUsage("Bearer ${workingCredential.accessToken}")
@@ -64,59 +69,64 @@ class ClaudeRepositoryImpl @Inject constructor(
                 }
                 401 -> {
                     // Try refresh once, then retry
-                    val refreshed = refreshToken(account, workingCredential)
-                    if (refreshed != null) {
-                        val retryResponse = apiService.getUsage("Bearer ${refreshed.accessToken}")
-                        if (retryResponse.isSuccessful) {
-                            val body = retryResponse.body()
-                                ?: return Result.Failure(AppError.ParseError("Empty response body"))
-                            val discoveredTier = extractTierFromHeaders(retryResponse)
-                                ?: extractTierFromJwt(refreshed.accessToken)
-                            val effectiveTier = discoveredTier ?: refreshed.rateLimitTier
-                            if (discoveredTier != null && discoveredTier != refreshed.rateLimitTier) {
-                                prefsManager.saveRefreshed(account.copy(credential = refreshed), refreshed.copy(rateLimitTier = discoveredTier))
-                            }
-                            Result.Success(mapToQuotaInfo(body, effectiveTier, account))
-                        } else {
-                            Result.Failure(AppError.AuthError(AiService.CLAUDE, isTerminal = true))
+                    val refreshed = when (val renewal = refreshToken(account, workingCredential)) {
+                        is Result.Success -> renewal.value
+                        is Result.Failure -> return renewal
+                    }
+                    val retryResponse = apiService.getUsage("Bearer ${refreshed.accessToken}")
+                    if (retryResponse.isSuccessful) {
+                        val body = retryResponse.body()
+                            ?: return Result.Failure(AppError.ParseError("Empty response body"))
+                        val discoveredTier = extractTierFromHeaders(retryResponse)
+                            ?: extractTierFromJwt(refreshed.accessToken)
+                        val effectiveTier = discoveredTier ?: refreshed.rateLimitTier
+                        if (discoveredTier != null && discoveredTier != refreshed.rateLimitTier) {
+                            prefsManager.saveRefreshed(account.copy(credential = refreshed), refreshed.copy(rateLimitTier = discoveredTier))
                         }
+                        Result.Success(mapToQuotaInfo(body, effectiveTier, account))
                     } else {
-                        Result.Failure(AppError.AuthError(AiService.CLAUDE, isTerminal = true))
+                        usageFailure(retryResponse.code())
                     }
                 }
-                429 -> Result.Failure(AppError.RateLimited)
-                else -> Result.Failure(
-                    AppError.NetworkError("HTTP ${response.code()}: ${response.message()}")
-                )
+                else -> usageFailure(response.code())
             }
+        } catch (e: CancellationException) { throw e
         } catch (e: IOException) {
-            Result.Failure(AppError.NetworkError(e.message ?: "Network error", e))
+            Result.Failure(AppError.NetworkError("Claude usage request failed; account is still saved"))
         } catch (e: Exception) {
-            Result.Failure(AppError.ParseError("Claude returned an unsupported usage response. Reconnect or retry later."))
+            Result.Failure(AppError.ParseError("Claude returned an unsupported usage response. Account is still saved; retry later."))
         }
     }
+
+    private fun usageFailure(status: Int): Result.Failure<AppError> = Result.Failure(when (status) {
+        401 -> AppError.AuthError(AiService.CLAUDE, true, "Claude rejected the renewed sign-in (HTTP 401). Reconnect this account.")
+        403 -> AppError.AuthError(AiService.CLAUDE, false, "Claude refused the usage request (HTTP 403). Account is still saved; retry later.")
+        429 -> AppError.RateLimited
+        in 500..599 -> AppError.ServiceUnavailable
+        else -> AppError.NetworkError("Claude usage HTTP $status")
+    })
 
     private suspend fun ensureValidToken(
         account: CredentialAccount,
         credential: Credential.ClaudeCredential
-    ): Credential.ClaudeCredential? {
-        val expiresAt = credential.expiresAt ?: return credential
-        if (Instant.now().isBefore(expiresAt.minusSeconds(60))) {
-            return credential
-        }
+    ): Result<Credential.ClaudeCredential, AppError> {
+        val expiresAt = credential.expiresAt
+        if (expiresAt == null || Instant.now().isBefore(expiresAt.minusSeconds(60))) return Result.Success(credential)
         return refreshToken(account, credential)
     }
 
     private suspend fun refreshToken(
         account: CredentialAccount,
         credential: Credential.ClaudeCredential
-    ): Credential.ClaudeCredential? {
-        val refreshToken = credential.refreshToken ?: return null
-
+    ): Result<Credential.ClaudeCredential, AppError> {
+        val refreshToken = credential.refreshToken
+            ?: return Result.Failure(AppError.AuthError(AiService.CLAUDE, true))
         return try {
             val response = tokenRefreshService.refreshToken(com.codexbar.android.core.network.claude.ClaudeRefreshRequest(refreshToken))
             if (response.isSuccessful) {
-                val body = response.body() ?: return null
+                val body = response.body()
+                    ?: return Result.Failure(AppError.ParseError("Claude renewal returned no data; account is still saved"))
+                require(body.accessToken.isNotBlank() && body.expiresIn > 0)
                 val newCredential = Credential.ClaudeCredential(
                     accessToken = body.accessToken,
                     refreshToken = body.refreshToken ?: refreshToken,
@@ -124,15 +134,46 @@ class ClaudeRepositoryImpl @Inject constructor(
                     scopes = credential.scopes,
                     rateLimitTier = credential.rateLimitTier
                 )
-                if (!prefsManager.saveRefreshed(account.copy(credential = credential), newCredential)) return null
-                newCredential
+                if (!prefsManager.saveRefreshed(account.copy(credential = credential), newCredential)) {
+                    return Result.Failure(AppError.CredentialNotFound(AiService.CLAUDE))
+                }
+                Result.Success(newCredential)
             } else {
-                null
+                Result.Failure(when (response.code()) {
+                    401 -> AppError.AuthError(AiService.CLAUDE, true, "Claude rejected sign-in renewal (HTTP 401). Reconnect this account.")
+                    400 -> if (isInvalidGrant(response)) AppError.AuthError(AiService.CLAUDE, true,
+                        "Claude revoked or expired this sign-in. Reconnect this account.")
+                        else AppError.AuthError(AiService.CLAUDE, false,
+                            "Claude renewal failed (HTTP 400). Account is still saved; retry later.")
+                    429 -> AppError.RateLimited
+                    in 500..599 -> AppError.ServiceUnavailable
+                    else -> AppError.AuthError(AiService.CLAUDE, false,
+                        "Claude renewal refused (HTTP ${response.code()}). Account is still saved; retry later.")
+                })
             }
+        } catch (e: CancellationException) { throw e
+        } catch (_: IOException) {
+            Result.Failure(AppError.NetworkError("Claude renewal could not reach the provider; account is still saved"))
         } catch (_: Exception) {
-            null
+            Result.Failure(AppError.ParseError("Claude renewal returned an unsupported response; account is still saved"))
         }
     }
+
+    /** Only an explicit, bounded OAuth error can turn a 400 into a reconnect instruction. */
+    private fun isInvalidGrant(response: retrofit2.Response<*>): Boolean = runCatching {
+        response.errorBody()?.use { body ->
+            val source = body.source()
+            source.request(16_385)
+            if (source.buffer.size > 16_384) return@use false
+            val error = Json.parseToJsonElement(source.readUtf8()).jsonObject["error"]
+            val type = when (error) {
+                is JsonPrimitive -> error.content
+                is JsonObject -> (error["type"] as? JsonPrimitive)?.content
+                else -> null
+            }
+            type == "invalid_grant"
+        } == true
+    }.getOrDefault(false)
 
     private fun extractTierFromHeaders(response: retrofit2.Response<*>): String? {
         val raw = response.headers()["anthropic-ratelimit-tier"]
