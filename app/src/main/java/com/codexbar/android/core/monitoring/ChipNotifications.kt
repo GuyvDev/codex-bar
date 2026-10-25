@@ -25,10 +25,11 @@ class ChipNotifications @Inject constructor(@ApplicationContext private val cont
     private val prefs: com.codexbar.android.core.security.EncryptedPrefsManager) {
     private val manager = context.getSystemService(NotificationManager::class.java)
     @Volatile var enabled: Boolean = false
-    private val shown = mutableSetOf<String>()
+    private data class Posted(val tag: String?, val id: Int)
+    private val shown = mutableSetOf<Posted>()
     init {
         manager.createNotificationChannel(NotificationChannel(CHANNEL, "Account quota chips", NotificationManager.IMPORTANCE_LOW).apply {
-            description = "One ongoing quota notification per account; Android decides status-bar chip visibility"
+            description = "Silent quota notification; Android requires it for the status-bar chip"
             setShowBadge(false)
             lockscreenVisibility = Notification.VISIBILITY_PRIVATE
         })
@@ -37,14 +38,21 @@ class ChipNotifications @Inject constructor(@ApplicationContext private val cont
     private fun openApp() = PendingIntent.getActivity(context, 7100,
         Intent(context, PhoneAccountsActivity::class.java), PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
 
+    private fun restoreAfterSwipe() = PendingIntent.getBroadcast(context, 7103,
+        Intent(context, RestoreChipReceiver::class.java).setAction(RestoreChipReceiver.RESTORE),
+        PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
+
+    private fun stopAction() = Notification.Action.Builder(Icon.createWithResource(context, R.drawable.ic_quota), "Stop",
+        PendingIntent.getService(context, 7101, Intent(context, LiveMonitorService::class.java).setAction(LiveMonitorService.STOP),
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)).build()
+
     fun controller(): Notification = Notification.Builder(context, CHANNEL)
         .setSmallIcon(R.drawable.ic_quota).setContentTitle("Live quota monitoring")
         .setContentText("OpenAI + Claude · every 60 seconds while Android permits · tap for controls")
         .setContentIntent(openApp()).setOngoing(true).setOnlyAlertOnce(true)
+        .setDeleteIntent(restoreAfterSwipe())
         .setVisibility(Notification.VISIBILITY_PRIVATE)
-        .addAction(Notification.Action.Builder(Icon.createWithResource(context, R.drawable.ic_quota), "Stop",
-            PendingIntent.getService(context, 7101, Intent(context, LiveMonitorService::class.java).setAction(LiveMonitorService.STOP),
-                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)).build())
+        .addAction(stopAction())
         .build()
 
     @Synchronized fun publish(readings: List<AccountReading>) {
@@ -54,18 +62,26 @@ class ChipNotifications @Inject constructor(@ApplicationContext private val cont
         val claude = readings.firstOrNull { it.account.service == AiService.CLAUDE }
         val paired = prefs.useCombinedChip() && openai != null && claude != null
         val visible = if (paired) listOf(openai!!) else readings
-        val current = visible.map { QuotaChip.id(it.account.service.name, it.account.id) }.toSet()
-        (shown - current).forEach { manager.cancel(it, ACCOUNT_ID) }
+        // The first quota notification also owns the foreground service. Combined mode
+        // therefore needs one shade row rather than a controller plus a duplicate quota row.
+        fun identity(index: Int, reading: AccountReading) = if (index == 0) Posted(null, CONTROL_ID)
+            else Posted(QuotaChip.id(reading.account.service.name, reading.account.id), ACCOUNT_ID)
+        val current = visible.mapIndexed(::identity).toSet()
+        (shown - current).forEach { manager.cancel(it.tag, it.id) }
         shown.retainAll(current)
-        visible.forEach { reading ->
-            val tag = QuotaChip.id(reading.account.service.name, reading.account.id)
+        visible.forEachIndexed { index, reading ->
+            val posted = identity(index, reading)
             prefs.runIfCurrent(reading.account) {
                 if (paired && !prefs.isCurrent(claude!!.account)) return@runIfCurrent
                 val notification = if (paired) combinedNotification(openai!!, claude!!) else accountNotification(reading)
-                manager.notify(tag, ACCOUNT_ID, notification)
-                shown.add(tag)
+                manager.notify(posted.tag, posted.id, notification)
+                shown.add(posted)
             }
         }
+        // Remove quota rows posted by an older version/process, using only app-owned IDs.
+        manager.activeNotifications.filter { it.id == ACCOUNT_ID && Posted(it.tag, it.id) !in current }
+            .forEach { manager.cancel(it.tag, it.id) }
+        if (visible.isEmpty()) manager.notify(CONTROL_ID, controller())
     }
 
     fun combinedNotification(openai: AccountReading, claude: AccountReading): Notification {
@@ -102,6 +118,7 @@ class ChipNotifications @Inject constructor(@ApplicationContext private val cont
             .setSmallIcon(icon).setContentTitle(title).setContentText(status)
             .setStyle(Notification.BigTextStyle().bigText("$detail\n$status\n~ means an old or failed reading"))
             .setContentIntent(openApp()).setOngoing(true).setOnlyAlertOnce(true).setShowWhen(false)
+            .setDeleteIntent(restoreAfterSwipe()).addAction(stopAction())
             .setVisibility(Notification.VISIBILITY_PRIVATE).setPublicVersion(publicVersion)
             .setColorized(true)
             .setColor(if (account.service == AiService.CODEX) 0xff10a37f.toInt() else 0xffd4a574.toInt())

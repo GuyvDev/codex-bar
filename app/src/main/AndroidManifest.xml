@@ -66,6 +66,8 @@
             </intent-filter>
         </service>
 
+        <receiver android:name=".core.monitoring.RestoreChipReceiver" android:exported="false" />
+
         <!-- Notification Refresh Receiver -->
         <receiver
             android:name=".core.notification.RefreshReceiver"

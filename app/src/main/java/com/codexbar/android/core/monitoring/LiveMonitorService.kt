@@ -26,10 +26,11 @@ class LiveMonitorService : Service() {
     private var loop: Job? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        if (intent?.action == STOP) { stopSelf(); return START_NOT_STICKY }
+        if (intent?.action == STOP) { chips.enabled = false; stopSelf(); return START_NOT_STICKY }
         chips.enabled = true
         if (Build.VERSION.SDK_INT >= 34) startForeground(ChipNotifications.CONTROL_ID, chips.controller(), ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
         else startForeground(ChipNotifications.CONTROL_ID, chips.controller())
+        chips.publish(state.readings())
         if (loop?.isActive != true) loop = scope.launch {
             while (isActive) {
                 val accounts = listOf(AiService.CODEX, AiService.CLAUDE).flatMap { prefs.loadCredentialAccounts(it) }

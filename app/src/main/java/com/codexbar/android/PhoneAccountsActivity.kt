@@ -99,7 +99,7 @@ class PhoneAccountsActivity : ComponentActivity() {
             })
         }
         content.addView(text("Live monitoring", 22f))
-        content.addView(text("About once per minute while the monitor is running. Provider rate limits, Doze, lost connectivity and GrapheneOS network permissions can delay updates. No push feed is available. A ~ prefix means an old or failed reading."))
+        content.addView(text("A native chip requires a silent notification in the notification shade. Swiping restores it while monitoring is on; tap Stop to remove it. About once per minute while the monitor is running. Provider rate limits, Doze, lost connectivity and GrapheneOS network permissions can delay updates. No push feed is available. A ~ prefix means an old or failed reading."))
         content.addView(Switch(this).apply {
             text = "One chip with both quotas (OpenAI / Claude)"
             isChecked = prefs.useCombinedChip()

@@ -19,6 +19,173 @@ import org.junit.runner.RunWith
 class DualChipDeviceTest {
     private val context: Context get() = InstrumentationRegistry.getInstrumentation().targetContext
 
+    @Test fun swipedCombinedNotificationRestoresCachedQuotaButStopDisablesRestoration() {
+        if (Build.VERSION.SDK_INT >= 33) InstrumentationRegistry.getInstrumentation().uiAutomation
+            .grantRuntimePermission(context.packageName, Manifest.permission.POST_NOTIFICATIONS)
+        val manager = context.getSystemService(NotificationManager::class.java)
+        var restore: android.app.PendingIntent? = null
+        lateinit var singleton: ChipNotifications
+        androidx.test.core.app.ActivityScenario.launch(PhoneAccountsActivity::class.java).use { scenario ->
+            try {
+                scenario.onActivity { activity ->
+                    val prefs = activity.prefs
+                    prefs.deleteAllCredentials()
+                    prefs.saveCredential(AiService.CODEX, "restore-openai", "OpenAI demo", Credential.CodexCredential("synthetic", "synthetic"))
+                    prefs.saveCredential(AiService.CLAUDE, "restore-claude", "Claude demo", Credential.ClaudeCredential("synthetic", "synthetic"))
+                    prefs.setCombinedChip(true)
+                    listOf(AiService.CODEX, AiService.CLAUDE).forEachIndexed { index, service ->
+                        val account = prefs.loadCredentialAccounts(service).first()
+                        activity.readings.record(account, Result.Success(QuotaInfo(service, account.id, account.label,
+                            listOf(UsageWindow("5-Hour", if (index == 0) .20 else .35, null)), null, fetchedAt = Instant.now())))
+                    }
+                    singleton = activity.chips
+                    singleton.enabled = true
+                    singleton.publish(activity.readings.readings())
+                }
+                fun ownRows() = manager.activeNotifications.filter { it.id == ChipNotifications.CONTROL_ID || it.id == ChipNotifications.ACCOUNT_ID }
+                fun waitForRow() {
+                    val deadline = System.currentTimeMillis() + 5000
+                    while (ownRows().isEmpty() && System.currentTimeMillis() < deadline) Thread.sleep(50)
+                }
+                waitForRow()
+                assertEquals(1, ownRows().size)
+                val initial = ownRows().single().notification
+                assertTrue(initial.extras.getCharSequence(Notification.EXTRA_TITLE).toString().contains("80/65"))
+                assertEquals(1, initial.actions.size)
+                assertEquals("Stop", initial.actions.single().title.toString())
+                restore = initial.deleteIntent
+                assertNotNull(restore)
+                fun deliverDismissal() {
+                    val delivered = java.util.concurrent.CountDownLatch(1)
+                    restore!!.send(context, 0, null, android.app.PendingIntent.OnFinished { _, _, _, _, _ -> delivered.countDown() }, null)
+                    assertTrue(delivered.await(10, java.util.concurrent.TimeUnit.SECONDS))
+                }
+                manager.cancel(ChipNotifications.CONTROL_ID)
+                val removedBy = System.currentTimeMillis() + 5000
+                while (ownRows().isNotEmpty() && System.currentTimeMillis() < removedBy) Thread.sleep(50)
+                assertTrue(ownRows().isEmpty())
+                // Android sends this app-owned intent after a swipe, not after app cancellation.
+                deliverDismissal()
+                waitForRow()
+                assertEquals(1, ownRows().size)
+                assertTrue(ownRows().single().notification.extras.getCharSequence(Notification.EXTRA_TITLE).toString().contains("80/65"))
+                singleton.enabled = false
+                singleton.clear()
+                deliverDismissal()
+                Thread.sleep(300)
+                assertTrue(ownRows().isEmpty())
+            } finally {
+                singleton.enabled = false; singleton.clear()
+                scenario.onActivity { it.prefs.deleteAllCredentials() }
+            }
+        }
+    }
+
+    @Test fun actualShadeSwipeRestoresQuotaNotification() {
+        if (Build.VERSION.SDK_INT < 36) return
+        val instrumentation = InstrumentationRegistry.getInstrumentation()
+        val serviceInfo = instrumentation.uiAutomation.serviceInfo
+        serviceInfo.flags = serviceInfo.flags or android.accessibilityservice.AccessibilityServiceInfo.FLAG_RETRIEVE_INTERACTIVE_WINDOWS
+        instrumentation.uiAutomation.serviceInfo = serviceInfo
+        if (Build.VERSION.SDK_INT >= 33) instrumentation.uiAutomation
+            .grantRuntimePermission(context.packageName, Manifest.permission.POST_NOTIFICATIONS)
+        val manager = context.getSystemService(NotificationManager::class.java)
+        var liveState: LiveQuotaState? = null
+        val serviceIntent = android.content.Intent(context, LiveMonitorService::class.java)
+        fun shell(command: String) {
+            android.os.ParcelFileDescriptor.AutoCloseInputStream(instrumentation.uiAutomation.executeShellCommand(command)).use { it.readBytes() }
+        }
+        androidx.test.core.app.ActivityScenario.launch(PhoneAccountsActivity::class.java).use { scenario ->
+            try {
+                scenario.onActivity { activity ->
+                    activity.prefs.deleteAllCredentials()
+                    activity.prefs.setCombinedChip(true)
+                    listOf(AiService.CODEX, AiService.CLAUDE).forEachIndexed { index, service ->
+                        val credential = if (service == AiService.CODEX) Credential.CodexCredential("synthetic", "synthetic")
+                            else Credential.ClaudeCredential("synthetic", "synthetic")
+                        activity.prefs.saveCredential(service, "gesture-${service.name}", "Demo", credential)
+                        val account = activity.prefs.loadCredentialAccounts(service).first()
+                        activity.readings.record(account, Result.Success(QuotaInfo(service, account.id, account.label,
+                            listOf(UsageWindow("5-Hour", if (index == 0) .20 else .35, null)), null, fetchedAt = Instant.now())))
+                    }
+                    activity.chips.enabled = true
+                    activity.chips.publish(activity.readings.readings())
+                    liveState = activity.readings
+                    activity.startForegroundService(serviceIntent)
+                }
+                // Network is disabled for synthetic accounts. Let the first polling cycle
+                // finish so a later post can only come from the swipe's deleteIntent.
+                val polledBy = System.currentTimeMillis() + 35_000
+                while (liveState!!.readings().any { it.error == null } && System.currentTimeMillis() < polledBy) Thread.sleep(100)
+                assertTrue("Initial offline polling cycle must finish before gesture", liveState!!.readings().all { it.error != null })
+                fun primary() = manager.activeNotifications.firstOrNull { it.id == ChipNotifications.CONTROL_ID }
+                val readyBy = System.currentTimeMillis() + 5000
+                while (primary() == null && System.currentTimeMillis() < readyBy) Thread.sleep(50)
+                assertTrue(primary()!!.notification.flags and Notification.FLAG_FOREGROUND_SERVICE != 0)
+                assertTrue(instrumentation.uiAutomation.performGlobalAction(android.accessibilityservice.AccessibilityService.GLOBAL_ACTION_HOME))
+                shell("cmd statusbar expand-notifications")
+                var target: android.view.accessibility.AccessibilityNodeInfo? = null
+                fun nodes(root: android.view.accessibility.AccessibilityNodeInfo): Sequence<android.view.accessibility.AccessibilityNodeInfo> = sequence {
+                    yield(root)
+                    for (index in 0 until root.childCount) root.getChild(index)?.let { yieldAll(nodes(it)) }
+                }
+                fun visibleNodes() = (instrumentation.uiAutomation.windows.mapNotNull { it.root } +
+                    listOfNotNull(instrumentation.uiAutomation.rootInActiveWindow)).asSequence().flatMap { nodes(it) }
+                val visibleBy = System.currentTimeMillis() + 15_000
+                while (target == null && System.currentTimeMillis() < visibleBy) {
+                    target = visibleNodes().firstOrNull { it.text?.contains("OpenAI / Claude") == true && it.isVisibleToUser }
+                    if (target == null) Thread.sleep(100)
+                }
+                if (target == null) {
+                    println("Notification shade nodes: " + visibleNodes().mapNotNull { it.text?.toString() }.toList())
+                    instrumentation.uiAutomation.takeScreenshot()?.let { bitmap ->
+                        java.io.File(context.cacheDir, "persistent-chip-shade-failure.png").outputStream().use {
+                            bitmap.compress(android.graphics.Bitmap.CompressFormat.PNG, 100, it)
+                        }
+                        bitmap.recycle()
+                    }
+                }
+                assertNotNull("Combined quota row must be visible in notification shade", target)
+                val bounds = android.graphics.Rect()
+                target!!.getBoundsInScreen(bounds)
+                val width = context.resources.displayMetrics.widthPixels
+                val before = primary()!!.postTime
+                shell("input swipe ${width / 2} ${bounds.centerY()} ${width - 5} ${bounds.centerY()} 350")
+                val restoredBy = System.currentTimeMillis() + 8000
+                while ((primary()?.postTime ?: 0) <= before && System.currentTimeMillis() < restoredBy) Thread.sleep(50)
+                assertTrue("Swiping must cause an immediate repost, without a polling cycle", (primary()?.postTime ?: 0) > before)
+                assertTrue(primary()!!.notification.hasPromotableCharacteristics())
+                assertTrue(primary()!!.notification.flags and Notification.FLAG_PROMOTED_ONGOING != 0)
+                assertEquals(1, manager.activeNotifications.count { it.id == ChipNotifications.CONTROL_ID || it.id == ChipNotifications.ACCOUNT_ID })
+                shell("cmd statusbar collapse")
+                Thread.sleep(500)
+                instrumentation.uiAutomation.takeScreenshot()?.let { bitmap ->
+                    java.io.File(context.cacheDir, "persistent-chip-restored.png").outputStream().use {
+                        bitmap.compress(android.graphics.Bitmap.CompressFormat.PNG, 100, it)
+                    }
+                    bitmap.recycle()
+                }
+                val dismissIntent = primary()!!.notification.deleteIntent
+                primary()!!.notification.actions.single().actionIntent.send()
+                val stoppedBy = System.currentTimeMillis() + 5000
+                while (primary() != null && System.currentTimeMillis() < stoppedBy) Thread.sleep(50)
+                assertNull("Stop action must remove the foreground chip", primary())
+                val delivered = java.util.concurrent.CountDownLatch(1)
+                dismissIntent.send(context, 0, null, android.app.PendingIntent.OnFinished { _, _, _, _, _ -> delivered.countDown() }, null)
+                assertTrue(delivered.await(10, java.util.concurrent.TimeUnit.SECONDS))
+                assertNull("A delayed dismissal after Stop must not resurrect the chip", primary())
+            } finally {
+                shell("cmd statusbar collapse")
+                context.stopService(serviceIntent)
+                scenario.onActivity { activity ->
+                    activity.chips.enabled = false
+                    activity.chips.clear()
+                    activity.prefs.deleteAllCredentials()
+                }
+            }
+        }
+    }
+
     @Test fun browserLoginModelSurvivesActivityRecreation() {
         androidx.test.core.app.ActivityScenario.launch(PhoneAccountsActivity::class.java).use { scenario ->
             var before: PhoneLoginViewModel? = null
@@ -68,7 +235,7 @@ class DualChipDeviceTest {
         prefs.deleteAllCredentials()
         chips.publish(readings)
         Thread.sleep(300)
-        assertTrue(context.getSystemService(NotificationManager::class.java).activeNotifications.none { it.id == ChipNotifications.ACCOUNT_ID })
+        assertTrue(context.getSystemService(NotificationManager::class.java).activeNotifications.none { (it.id == ChipNotifications.ACCOUNT_ID || it.id == ChipNotifications.CONTROL_ID) })
         // Recreate only synthetic readings for visual inspection of the fallback.
         prefs.saveCredential(AiService.CODEX, openai.id, "OpenAI demo", openai.credential)
         prefs.saveCredential(AiService.CLAUDE, claude.id, "Claude demo", claude.credential)
@@ -119,10 +286,10 @@ class DualChipDeviceTest {
         chips.publish(readings)
         val manager = context.getSystemService(NotificationManager::class.java)
         val deadline = System.currentTimeMillis() + 5000
-        while (manager.activeNotifications.count { it.id == ChipNotifications.ACCOUNT_ID } < 2 && System.currentTimeMillis() < deadline) Thread.sleep(50)
-        val active = manager.activeNotifications.filter { it.id == ChipNotifications.ACCOUNT_ID }
+        while (manager.activeNotifications.count { (it.id == ChipNotifications.ACCOUNT_ID || it.id == ChipNotifications.CONTROL_ID) } < 2 && System.currentTimeMillis() < deadline) Thread.sleep(50)
+        val active = manager.activeNotifications.filter { (it.id == ChipNotifications.ACCOUNT_ID || it.id == ChipNotifications.CONTROL_ID) }
         assertEquals(2, active.size)
-        assertEquals(2, active.map { it.tag }.distinct().size)
+        assertEquals(2, active.map { it.tag to it.id }.distinct().size)
         assertTrue(active.any { it.notification.extras.getCharSequence(Notification.EXTRA_TITLE).toString().contains("80%") })
         assertTrue(active.any { it.notification.extras.getCharSequence(Notification.EXTRA_TITLE).toString().contains("65%") })
         // Leave synthetic notifications for an external screenshot; no real account is used.
