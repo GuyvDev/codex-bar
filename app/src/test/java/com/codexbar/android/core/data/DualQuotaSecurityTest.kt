@@ -37,6 +37,17 @@ class DualQuotaSecurityTest {
         assertNull(QuotaChip.remaining(quota.copy(windows = listOf(UsageWindow("invalid", Double.NaN, null)))))
     }
 
+    @Test fun compactPairHasFixedProviderOrderAndDoesNotPresentStaleDataAsLive() {
+        val now = Instant.now()
+        val openai = QuotaInfo(AiService.CODEX, windows = listOf(UsageWindow("5-Hour", .20, null)), extraUsage = null, fetchedAt = now)
+        val claude = openai.copy(service = AiService.CLAUDE, windows = listOf(UsageWindow("5-Hour", .35, null)))
+        assertEquals("80/65", QuotaChip.pairText(openai, false, claude, false))
+        assertEquals("?/65", QuotaChip.pairText(openai, true, claude, false))
+        assertEquals("80/?", QuotaChip.pairText(openai, false, claude.copy(fetchedAt = now.minusSeconds(151)), false))
+        val full = openai.copy(windows = listOf(UsageWindow("5-Hour", 0.0, null)))
+        assertEquals("100/100", QuotaChip.pairText(full, false, full, false))
+    }
+
     @Test fun serverRetryAfterIsRespectedWithoutAnImmediateRetryLoop() {
         assertEquals(3600L, RetryInterceptor.retryDelaySeconds("3600"))
         assertEquals(60L, RetryInterceptor.retryDelaySeconds("-1"))

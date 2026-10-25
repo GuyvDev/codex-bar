@@ -37,6 +37,34 @@ class DualChipDeviceTest {
         prefs.deleteAllCredentials()
     }
 
+    @Test fun combinedChipKeepsBothQuotasVisibleAndLogoutCannotRepostIt() {
+        dualNotificationsHaveIndependentIdentityAndPromotionRequests()
+        val prefs = EncryptedPrefsManager(context)
+        val chips = ChipNotifications(context, prefs).apply { enabled = true }
+        val openai = prefs.loadCredentialAccounts(AiService.CODEX).first()
+        val claude = prefs.loadCredentialAccounts(AiService.CLAUDE).first()
+        fun reading(account: CredentialAccount, used: Double) = AccountReading(account,
+            QuotaInfo(account.service, account.id, account.label, listOf(UsageWindow("5-Hour", used, null)), null, fetchedAt = Instant.now()))
+        val readings = listOf(reading(openai, .20), reading(claude, .35))
+        prefs.setCombinedChip(true)
+        val notification = chips.combinedNotification(readings[0], readings[1])
+        if (Build.VERSION.SDK_INT >= 36) {
+            assertEquals("80/65", notification.shortCriticalText)
+            assertTrue(notification.hasPromotableCharacteristics())
+        }
+        chips.publish(readings)
+        // Also prove that a stale snapshot cannot restore a logged-out account notification.
+        prefs.deleteAllCredentials()
+        chips.publish(readings)
+        Thread.sleep(300)
+        assertTrue(context.getSystemService(NotificationManager::class.java).activeNotifications.none { it.id == ChipNotifications.ACCOUNT_ID })
+        // Recreate only synthetic readings for visual inspection of the fallback.
+        prefs.saveCredential(AiService.CODEX, openai.id, "OpenAI demo", openai.credential)
+        prefs.saveCredential(AiService.CLAUDE, claude.id, "Claude demo", claude.credential)
+        chips.publish(listOf(reading(prefs.loadCredentialAccounts(AiService.CODEX).first(), .20),
+            reading(prefs.loadCredentialAccounts(AiService.CLAUDE).first(), .35)))
+    }
+
     @Test fun loopbackRejectsWrongStateAndRemainsCancellable() {
         val client = com.codexbar.android.core.security.PhoneLoginClient()
         val opened = java.util.concurrent.CompletableFuture<String>()
@@ -61,6 +89,7 @@ class DualChipDeviceTest {
         prefs.deleteAllCredentials()
         prefs.saveCredential(AiService.CODEX, "proof-openai", "OpenAI demo", Credential.CodexCredential("synthetic", "synthetic"))
         prefs.saveCredential(AiService.CLAUDE, "proof-claude", "Claude demo", Credential.ClaudeCredential("synthetic", "synthetic"))
+        prefs.setCombinedChip(false)
         val chips = ChipNotifications(context, prefs).apply { enabled = true }
         val accounts = listOf(AiService.CODEX, AiService.CLAUDE).map { prefs.loadCredentialAccounts(it).first() }
         val readings = accounts.mapIndexed { index, account ->

@@ -50,16 +50,37 @@ class ChipNotifications @Inject constructor(@ApplicationContext private val cont
     @Synchronized fun publish(readings: List<AccountReading>) {
         if (!enabled) return
         if (Build.VERSION.SDK_INT >= 33 && context.checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) return
-        val current = readings.map { QuotaChip.id(it.account.service.name, it.account.id) }.toSet()
+        val openai = readings.firstOrNull { it.account.service == AiService.CODEX }
+        val claude = readings.firstOrNull { it.account.service == AiService.CLAUDE }
+        val paired = prefs.useCombinedChip() && openai != null && claude != null
+        val visible = if (paired) listOf(openai!!) else readings
+        val current = visible.map { QuotaChip.id(it.account.service.name, it.account.id) }.toSet()
         (shown - current).forEach { manager.cancel(it, ACCOUNT_ID) }
         shown.retainAll(current)
-        readings.forEach { reading ->
+        visible.forEach { reading ->
             val tag = QuotaChip.id(reading.account.service.name, reading.account.id)
             prefs.runIfCurrent(reading.account) {
-                manager.notify(tag, ACCOUNT_ID, accountNotification(reading))
+                if (paired && !prefs.isCurrent(claude!!.account)) return@runIfCurrent
+                val notification = if (paired) combinedNotification(openai!!, claude!!) else accountNotification(reading)
+                manager.notify(tag, ACCOUNT_ID, notification)
                 shown.add(tag)
             }
         }
+    }
+
+    fun combinedNotification(openai: AccountReading, claude: AccountReading): Notification {
+        val short = QuotaChip.pairText(openai.quota, openai.error != null, claude.quota, claude.error != null)
+        val first = accountNotification(openai)
+        val second = accountNotification(claude)
+        val detail = "OpenAI first / Claude second · remaining quota\n" +
+            "${first.extras.getCharSequence(Notification.EXTRA_TITLE)}\n${first.extras.getCharSequence(Notification.EXTRA_BIG_TEXT)}\n\n" +
+            "${second.extras.getCharSequence(Notification.EXTRA_TITLE)}\n${second.extras.getCharSequence(Notification.EXTRA_BIG_TEXT)}"
+        val builder = Notification.Builder.recoverBuilder(context, first)
+            .setContentTitle("OpenAI / Claude · $short remaining")
+            .setContentText("OpenAI first / Claude second · ? means missing, old or failed")
+            .setStyle(Notification.BigTextStyle().bigText(detail))
+        if (Build.VERSION.SDK_INT >= 36) builder.setShortCriticalText(short)
+        return builder.build()
     }
 
     fun accountNotification(reading: AccountReading): Notification {

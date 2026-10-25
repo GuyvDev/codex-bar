@@ -16,5 +16,12 @@ object QuotaChip {
         return "$value%"
     }
 
+    /** O/C order; stale values become ? so the compact pair always fits seven characters. */
+    fun pairText(openai: QuotaInfo?, openaiFailed: Boolean, claude: QuotaInfo?, claudeFailed: Boolean): String {
+        fun part(quota: QuotaInfo?, failed: Boolean): String = shortText(quota, failed)
+            .let { if (it.startsWith("~")) "?" else it.removeSuffix("%") }
+        return "${part(openai, openaiFailed)}/${part(claude, claudeFailed)}"
+    }
+
     fun id(service: String, accountId: String): String = "$service:$accountId"
 }

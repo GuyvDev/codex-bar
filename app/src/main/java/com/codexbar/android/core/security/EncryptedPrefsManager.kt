@@ -195,6 +195,9 @@ class EncryptedPrefsManager @Inject constructor(
         return loadCredentialAccounts(service).isNotEmpty()
     }
 
+    fun useCombinedChip(): Boolean = prefs.getBoolean("combined_chip", true)
+    fun setCombinedChip(enabled: Boolean) { prefs.edit().putBoolean("combined_chip", enabled).apply() }
+
     fun getRefreshInterval(): Long {
         return prefs.getLong("refresh_interval_minutes", 30L)
     }

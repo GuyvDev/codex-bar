@@ -59,7 +59,7 @@ class PhoneAccountsActivity : ComponentActivity() {
         content = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(32, 64, 32, 40) }
         content.addView(text("AI Quota", 30f))
         content.addView(text("OpenAI + Claude · on this phone", 18f))
-        content.addView(text("Each chip shows the remaining quota of the first usage window (usually 5 hours). Weekly limits are shown in the dashboard. Android controls chip visibility and may hide text when space is limited."))
+        content.addView(text("The status bar shows remaining quota of the first window (usually 5 hours). OpenAI / Claude order in combined mode. Android may display only one chip even when two notifications are promoted. Weekly limits are in the dashboard."))
         for (service in listOf(AiService.CODEX, AiService.CLAUDE)) {
             val account = prefs.loadCredentialAccounts(service).firstOrNull()
             val provider = if (service == AiService.CODEX) "OpenAI / Codex" else "Claude"
@@ -85,6 +85,16 @@ class PhoneAccountsActivity : ComponentActivity() {
         }
         content.addView(text("Live monitoring", 22f))
         content.addView(text("About once per minute while the monitor is running. Provider rate limits, Doze, lost connectivity and GrapheneOS network permissions can delay updates. No push feed is available. A ~ prefix means an old or failed reading."))
+        content.addView(Switch(this).apply {
+            text = "One chip with both quotas (OpenAI / Claude)"
+            isChecked = prefs.useCombinedChip()
+            setOnCheckedChangeListener { _, checked ->
+                prefs.setCombinedChip(checked)
+                chips.publish(readings.readings())
+                status.text = if (checked) "Combined mode: OpenAI first / Claude second. ? means missing, old or failed."
+                    else "Two separate notifications requested. Android may still show only one chip."
+            }
+        })
         content.addView(button("Start live monitoring") { startLive() })
         content.addView(button("Stop live monitoring") { stopService(Intent(this, LiveMonitorService::class.java)); chips.clear(); status.text = "Live monitoring stopped" })
         content.addView(button("Allow status-bar chips") {
