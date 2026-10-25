@@ -20,10 +20,13 @@ import org.junit.Before
 import org.junit.Test
 import com.jakewharton.retrofit2.converter.kotlinx.serialization.asConverterFactory
 import kotlinx.coroutines.test.runTest
+import kotlinx.coroutines.async
 import okhttp3.MediaType.Companion.toMediaType
 import org.mockito.Mockito.mock
 import org.mockito.Mockito.`when`
 import retrofit2.Retrofit
+
+private fun <T> anyArg(): T = org.mockito.ArgumentMatchers.any()
 
 class ClaudeRepositoryImplTest {
 
@@ -32,7 +35,7 @@ class ClaudeRepositoryImplTest {
     private lateinit var tokenRefreshService: ClaudeTokenRefreshService
     private lateinit var prefsManager: EncryptedPrefsManager
     private lateinit var repository: ClaudeRepositoryImpl
-    private val json = Json { ignoreUnknownKeys = true; coerceInputValues = true; isLenient = true }
+    private val json = Json { ignoreUnknownKeys = true; encodeDefaults = true }
 
     private val testCredential = Credential.ClaudeCredential(
         accessToken = "test-access-token",
@@ -65,6 +68,11 @@ class ClaudeRepositoryImplTest {
         `when`(prefsManager.loadCredentialAccounts(AiService.CLAUDE)).thenReturn(
             listOf(testAccount(testCredential))
         )
+
+        `when`(prefsManager.loadCredentialAccount(AiService.CLAUDE, "claude-test")).thenAnswer {
+            prefsManager.loadCredentialAccounts(AiService.CLAUDE).firstOrNull()
+        }
+        `when`(prefsManager.saveRefreshed(anyArg(), anyArg())).thenReturn(true)
 
         repository = ClaudeRepositoryImpl(apiService, tokenRefreshService, prefsManager)
     }
@@ -253,6 +261,43 @@ class ClaudeRepositoryImplTest {
         assertTrue(result is Result.Success)
         val quotaInfo = (result as Result.Success).value
         assertTrue(quotaInfo.extraUsage == null)
+    }
+
+    @Test fun `expired token renews once across parallel fetches and persists rotated token`() = kotlinx.coroutines.runBlocking {
+        var current = testAccount(testCredential.copy(expiresAt = java.time.Instant.EPOCH))
+        org.mockito.Mockito.doAnswer { current }.`when`(prefsManager).loadCredentialAccount(AiService.CLAUDE, current.id)
+        `when`(prefsManager.saveRefreshed(anyArg(), anyArg())).thenAnswer { invocation ->
+            current = current.copy(credential = invocation.getArgument<Credential>(1)); true
+        }
+        mockWebServer.enqueue(MockResponse().setBody("""{"access_token":"rotated-access","refresh_token":"rotated-refresh","expires_in":3600}"""))
+        repeat(2) { mockWebServer.enqueue(MockResponse().setBody("""{"five_hour":{"utilization":35}}""")) }
+        val snapshot = current
+        val results = kotlinx.coroutines.coroutineScope {
+            listOf(async { repository.fetchQuota(snapshot) }, async { repository.fetchQuota(snapshot) }).map { it.await() }
+        }
+        assertTrue(results.all { it is Result.Success })
+        assertEquals("rotated-refresh", current.credential.refreshToken)
+        val renewal = mockWebServer.takeRequest()
+        assertEquals("/v1/oauth/token", renewal.path)
+        assertTrue(renewal.getHeader("Content-Type")!!.startsWith("application/json"))
+        val renewalBody = renewal.body.readUtf8()
+        assertTrue(renewalBody.contains("\"grant_type\":\"refresh_token\""))
+        assertTrue(renewalBody.contains(ClaudeTokenRefreshService.CLAUDE_CLIENT_ID))
+        repeat(2) { assertEquals("Bearer rotated-access", mockWebServer.takeRequest().getHeader("Authorization")) }
+        assertEquals(3, mockWebServer.requestCount)
+    }
+
+    @Test fun `logout during renewal prevents retry with the discarded new token`() = runTest {
+        `when`(prefsManager.loadCredentialAccounts(AiService.CLAUDE)).thenReturn(listOf(testAccount(testCredential.copy(expiresAt = java.time.Instant.EPOCH))))
+        `when`(prefsManager.saveRefreshed(anyArg(), anyArg())).thenReturn(false)
+        mockWebServer.enqueue(MockResponse().setBody("""{"access_token":"discarded","refresh_token":"discarded","expires_in":3600}"""))
+        assertTrue(repository.fetchQuota() is Result.Failure)
+        assertEquals(1, mockWebServer.requestCount)
+    }
+
+    @Test fun `missing usage is an error rather than a fresh zero`() = runTest {
+        mockWebServer.enqueue(MockResponse().setBody("""{"five_hour":{}}"""))
+        assertTrue(repository.fetchQuota() is Result.Failure)
     }
 
     private fun testAccount(credential: Credential.ClaudeCredential): CredentialAccount {

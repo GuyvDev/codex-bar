@@ -1,0 +1,109 @@
+package com.codexbar.android.core.monitoring
+
+import android.Manifest
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.PendingIntent
+import android.content.Context
+import android.content.Intent
+import android.content.pm.PackageManager
+import android.graphics.drawable.Icon
+import android.os.Build
+import com.codexbar.android.PhoneAccountsActivity
+import com.codexbar.android.MainActivity
+import com.codexbar.android.R
+import com.codexbar.android.core.domain.model.AiService
+import dagger.hilt.android.qualifiers.ApplicationContext
+import java.time.Duration
+import java.time.Instant
+import javax.inject.Inject
+import javax.inject.Singleton
+
+@Singleton
+class ChipNotifications @Inject constructor(@ApplicationContext private val context: Context,
+    private val prefs: com.codexbar.android.core.security.EncryptedPrefsManager) {
+    private val manager = context.getSystemService(NotificationManager::class.java)
+    @Volatile var enabled: Boolean = false
+    private val shown = mutableSetOf<String>()
+    init {
+        manager.createNotificationChannel(NotificationChannel(CHANNEL, "Account quota chips", NotificationManager.IMPORTANCE_LOW).apply {
+            description = "One ongoing quota notification per account; Android decides status-bar chip visibility"
+            setShowBadge(false)
+            lockscreenVisibility = Notification.VISIBILITY_PRIVATE
+        })
+    }
+
+    private fun openApp() = PendingIntent.getActivity(context, 7100,
+        Intent(context, PhoneAccountsActivity::class.java), PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
+
+    fun controller(): Notification = Notification.Builder(context, CHANNEL)
+        .setSmallIcon(R.drawable.ic_quota).setContentTitle("Live quota monitoring")
+        .setContentText("OpenAI + Claude · every 60 seconds while Android permits · tap for controls")
+        .setContentIntent(openApp()).setOngoing(true).setOnlyAlertOnce(true)
+        .setVisibility(Notification.VISIBILITY_PRIVATE)
+        .addAction(Notification.Action.Builder(Icon.createWithResource(context, R.drawable.ic_quota), "Stop",
+            PendingIntent.getService(context, 7101, Intent(context, LiveMonitorService::class.java).setAction(LiveMonitorService.STOP),
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)).build())
+        .build()
+
+    @Synchronized fun publish(readings: List<AccountReading>) {
+        if (!enabled) return
+        if (Build.VERSION.SDK_INT >= 33 && context.checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) return
+        val current = readings.map { QuotaChip.id(it.account.service.name, it.account.id) }.toSet()
+        (shown - current).forEach { manager.cancel(it, ACCOUNT_ID) }
+        shown.retainAll(current)
+        readings.forEach { reading ->
+            val tag = QuotaChip.id(reading.account.service.name, reading.account.id)
+            prefs.runIfCurrent(reading.account) {
+                manager.notify(tag, ACCOUNT_ID, accountNotification(reading))
+                shown.add(tag)
+            }
+        }
+    }
+
+    fun accountNotification(reading: AccountReading): Notification {
+        val account = reading.account
+        val quota = reading.quota
+        val short = QuotaChip.shortText(quota, reading.error != null)
+        val provider = if (account.service == AiService.CODEX) "OpenAI" else "Claude"
+        val title = "$provider · ${account.label} · $short remaining"
+        val age = quota?.let { Duration.between(it.fetchedAt, Instant.now()).seconds.coerceAtLeast(0) }
+        val detail = quota?.windows?.joinToString(" · ") {
+            val remaining = ((1 - it.utilization) * 100).toInt().coerceIn(0, 100)
+            "${it.label}: $remaining% remaining" + (it.resetsAt?.let { reset -> " · resets $reset" } ?: "")
+        } ?: "Waiting for first successful reading"
+        val status = reading.error ?: "Last successful update ${age ?: 0}s ago"
+        val icon = if (account.service == AiService.CODEX) R.drawable.ic_service_codex else R.drawable.ic_service_claude
+        val publicVersion = Notification.Builder(context, CHANNEL).setSmallIcon(icon)
+            .setContentTitle("AI quota monitor").setContentText("Unlock to see account usage").build()
+        val builder = Notification.Builder(context, CHANNEL)
+            .setSmallIcon(icon).setContentTitle(title).setContentText(status)
+            .setStyle(Notification.BigTextStyle().bigText("$detail\n$status\n~ means an old or failed reading"))
+            .setContentIntent(openApp()).setOngoing(true).setOnlyAlertOnce(true).setShowWhen(false)
+            .setVisibility(Notification.VISIBILITY_PRIVATE).setPublicVersion(publicVersion)
+            .setColorized(true)
+            .setColor(if (account.service == AiService.CODEX) 0xff10a37f.toInt() else 0xffd4a574.toInt())
+        if (Build.VERSION.SDK_INT >= 36) {
+            builder.setShortCriticalText(short)
+            // Android 16 initial release uses colorized+ongoing. Later releases add an explicit request API.
+            val explicitRequest = runCatching { builder.javaClass.getMethod("setRequestPromotedOngoing", Boolean::class.javaPrimitiveType).invoke(builder, true) }.isSuccess
+            // Newer Android requires the explicit request and disallows colorization.
+            builder.setColorized(!explicitRequest)
+        }
+        return builder.build()
+    }
+
+    @Synchronized fun clear() {
+        // Also remove notifications left by a previous process.
+        manager.activeNotifications.filter { it.id == ACCOUNT_ID || it.id == CONTROL_ID || it.id == 1001 || it.id >= 2000 }
+            .forEach { manager.cancel(it.tag, it.id) }
+        shown.clear()
+    }
+
+    companion object {
+        const val CHANNEL = "dual_account_live"
+        const val ACCOUNT_ID = 7102
+        const val CONTROL_ID = 7100
+    }
+}

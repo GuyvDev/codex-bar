@@ -32,7 +32,15 @@ class ClaudeRepositoryImpl @Inject constructor(
         return fetchQuota(account)
     }
 
-    override suspend fun fetchQuota(account: CredentialAccount): Result<QuotaInfo, AppError> {
+    override suspend fun fetchQuota(account: CredentialAccount): Result<QuotaInfo, AppError> =
+        AccountLocks.withAccount(account) {
+            val current = prefsManager.loadCredentialAccount(account.service, account.id)
+                ?: return@withAccount Result.Failure(AppError.CredentialNotFound(account.service))
+            if (current.generation != account.generation) return@withAccount Result.Failure(AppError.CredentialNotFound(account.service))
+            fetchCurrent(current)
+        }
+
+    private suspend fun fetchCurrent(account: CredentialAccount): Result<QuotaInfo, AppError> {
         val credential = account.credential as? Credential.ClaudeCredential
             ?: return Result.Failure(AppError.CredentialNotFound(AiService.CLAUDE))
 
@@ -50,12 +58,7 @@ class ClaudeRepositoryImpl @Inject constructor(
                         ?: extractTierFromJwt(workingCredential.accessToken)
                     val effectiveTier = discoveredTier ?: workingCredential.rateLimitTier
                     if (discoveredTier != null && discoveredTier != workingCredential.rateLimitTier) {
-                        prefsManager.saveCredential(
-                            AiService.CLAUDE,
-                            account.id,
-                            account.label,
-                            workingCredential.copy(rateLimitTier = discoveredTier)
-                        )
+                        prefsManager.saveRefreshed(account.copy(credential = workingCredential), workingCredential.copy(rateLimitTier = discoveredTier))
                     }
                     Result.Success(mapToQuotaInfo(body, effectiveTier, account))
                 }
@@ -71,12 +74,7 @@ class ClaudeRepositoryImpl @Inject constructor(
                                 ?: extractTierFromJwt(refreshed.accessToken)
                             val effectiveTier = discoveredTier ?: refreshed.rateLimitTier
                             if (discoveredTier != null && discoveredTier != refreshed.rateLimitTier) {
-                                prefsManager.saveCredential(
-                                    AiService.CLAUDE,
-                                    account.id,
-                                    account.label,
-                                    refreshed.copy(rateLimitTier = discoveredTier)
-                                )
+                                prefsManager.saveRefreshed(account.copy(credential = refreshed), refreshed.copy(rateLimitTier = discoveredTier))
                             }
                             Result.Success(mapToQuotaInfo(body, effectiveTier, account))
                         } else {
@@ -116,7 +114,7 @@ class ClaudeRepositoryImpl @Inject constructor(
         val refreshToken = credential.refreshToken ?: return null
 
         return try {
-            val response = tokenRefreshService.refreshToken(refreshToken = refreshToken)
+            val response = tokenRefreshService.refreshToken(com.codexbar.android.core.network.claude.ClaudeRefreshRequest(refreshToken))
             if (response.isSuccessful) {
                 val body = response.body() ?: return null
                 val newCredential = Credential.ClaudeCredential(
@@ -126,7 +124,7 @@ class ClaudeRepositoryImpl @Inject constructor(
                     scopes = credential.scopes,
                     rateLimitTier = credential.rateLimitTier
                 )
-                prefsManager.saveCredential(AiService.CLAUDE, account.id, account.label, newCredential)
+                if (!prefsManager.saveRefreshed(account.copy(credential = credential), newCredential)) return null
                 newCredential
             } else {
                 null
@@ -173,6 +171,7 @@ class ClaudeRepositoryImpl @Inject constructor(
             response.iguanaNecktie?.let { add(mapWindow("Extended", it)) }
         }
 
+        require(windows.isNotEmpty()) { "No usage windows returned" }
         val extraUsage = response.extraUsage?.takeIf { it.isEnabled }?.let {
             ExtraUsage(
                 isEnabled = it.isEnabled,
@@ -195,9 +194,11 @@ class ClaudeRepositoryImpl @Inject constructor(
     }
 
     private fun mapWindow(label: String, window: ClaudeDto.OAuthUsageWindow): UsageWindow {
+        val usage = window.utilization ?: throw IllegalArgumentException("Missing usage value")
+        require(usage.isFinite() && usage in 0.0..100.0) { "Invalid usage value" }
         return UsageWindow(
             label = label,
-            utilization = ((window.utilization ?: 0.0) / 100.0).coerceIn(0.0, 1.0),
+            utilization = usage / 100.0,
             resetsAt = window.resetsAt?.let { parseInstant(it) }
         )
     }
