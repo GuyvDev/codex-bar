@@ -19,7 +19,7 @@ Device tests use synthetic credentials only. Install debug APK and app-debug-and
 adb shell am instrument -w -r com.local.aquota.debug.test/androidx.test.runner.AndroidJUnitRunner
 ```
 
-Run the dualNotificationsHaveIndependentIdentityAndPromotionRequests test separately to leave two synthetic quota notifications for visual inspection. No release demo mode, remote credential import or test account backdoor is included. Live provider sign-in is not verified by these tests.
+Run dualNotificationsHaveIndependentIdentityAndPromotionRequests separately for two synthetic quota notifications; run combinedChipKeepsBothQuotasVisibleAndLogoutCannotRepostIt for the combined fallback. The API 37 emulator promoted both separate notifications but displayed only one chip in both portrait and landscape. Default mode therefore combines percentages in OpenAI/Claude order, e.g. 80/65; stale or failed values become ?. Users can turn this mode off to request separate chips on their own OS. No release demo mode, remote credential import or test account backdoor is included. Live provider sign-in is not verified by these tests.
 
 User-started foreground monitoring polls about once per minute, subject to Android scheduling and provider limits. Two notifications request promotion; the OS controls actual chip visibility, layout and text truncation. See the accompanying Hebrew security report and device results for tested behavior and limitations.
 
