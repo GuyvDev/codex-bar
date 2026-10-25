@@ -19,6 +19,30 @@ import org.junit.runner.RunWith
 class DualChipDeviceTest {
     private val context: Context get() = InstrumentationRegistry.getInstrumentation().targetContext
 
+    private fun sharedPrefs(): EncryptedPrefsManager {
+        lateinit var prefs: EncryptedPrefsManager
+        androidx.test.core.app.ActivityScenario.launch(PhoneAccountsActivity::class.java).use { scenario ->
+            scenario.onActivity { prefs = it.prefs }
+        }
+        return prefs
+    }
+
+    @org.junit.Before fun stopPreviousMonitor() {
+        context.stopService(android.content.Intent(context, LiveMonitorService::class.java))
+        InstrumentationRegistry.getInstrumentation().waitForIdleSync()
+        androidx.test.core.app.ActivityScenario.launch(PhoneAccountsActivity::class.java).use { scenario ->
+            scenario.onActivity { activity ->
+                activity.chips.enabled = false
+                activity.chips.clear()
+                activity.prefs.deleteAllCredentials()
+            }
+        }
+        val manager = context.getSystemService(NotificationManager::class.java)
+        val deadline = System.currentTimeMillis() + 5000
+        while (manager.activeNotifications.isNotEmpty() && System.currentTimeMillis() < deadline) Thread.sleep(50)
+        assertTrue("Previous test notifications must be removed", manager.activeNotifications.isEmpty())
+    }
+
     @Test fun swipedCombinedNotificationRestoresCachedQuotaButStopDisablesRestoration() {
         if (Build.VERSION.SDK_INT >= 33) InstrumentationRegistry.getInstrumentation().uiAutomation
             .grantRuntimePermission(context.packageName, Manifest.permission.POST_NOTIFICATIONS)
@@ -70,7 +94,8 @@ class DualChipDeviceTest {
                 deliverDismissal()
                 waitForRow()
                 assertEquals(1, ownRows().size)
-                assertTrue(ownRows().single().notification.extras.getCharSequence(Notification.EXTRA_TITLE).toString().contains("80/65"))
+                assertEquals("OpenAI / Claude", ownRows().single().notification.extras.getCharSequence(Notification.EXTRA_TITLE).toString())
+                if (Build.VERSION.SDK_INT >= 36) assertEquals("80/65", ownRows().single().notification.shortCriticalText)
                 singleton.enabled = false
                 singleton.clear()
                 deliverDismissal()
@@ -125,6 +150,8 @@ class DualChipDeviceTest {
                 while (primary() == null && System.currentTimeMillis() < readyBy) Thread.sleep(50)
                 assertTrue(primary()!!.notification.flags and Notification.FLAG_FOREGROUND_SERVICE != 0)
                 assertTrue(instrumentation.uiAutomation.performGlobalAction(android.accessibilityservice.AccessibilityService.GLOBAL_ACTION_HOME))
+                instrumentation.waitForIdleSync()
+                Thread.sleep(1000)
                 shell("cmd statusbar expand-notifications")
                 var target: android.view.accessibility.AccessibilityNodeInfo? = null
                 fun nodes(root: android.view.accessibility.AccessibilityNodeInfo): Sequence<android.view.accessibility.AccessibilityNodeInfo> = sequence {
@@ -135,8 +162,11 @@ class DualChipDeviceTest {
                     listOfNotNull(instrumentation.uiAutomation.rootInActiveWindow)).asSequence().flatMap { nodes(it) }
                 val visibleBy = System.currentTimeMillis() + 15_000
                 while (target == null && System.currentTimeMillis() < visibleBy) {
-                    target = visibleNodes().firstOrNull { it.text?.contains("OpenAI / Claude") == true && it.isVisibleToUser }
-                    if (target == null) Thread.sleep(100)
+                    target = visibleNodes().firstOrNull { it.text?.toString() == "OpenAI / Claude" && it.isVisibleToUser }
+                    if (target == null) {
+                        shell("cmd statusbar expand-notifications")
+                        Thread.sleep(500)
+                    }
                 }
                 if (target == null) {
                     println("Notification shade nodes: " + visibleNodes().mapNotNull { it.text?.toString() }.toList())
@@ -152,7 +182,7 @@ class DualChipDeviceTest {
                 target!!.getBoundsInScreen(bounds)
                 val width = context.resources.displayMetrics.widthPixels
                 val before = primary()!!.postTime
-                shell("input swipe ${width / 2} ${bounds.centerY()} ${width - 5} ${bounds.centerY()} 350")
+                shell("input swipe ${width / 8} ${bounds.centerY()} ${width - 5} ${bounds.centerY()} 250")
                 val restoredBy = System.currentTimeMillis() + 8000
                 while ((primary()?.postTime ?: 0) <= before && System.currentTimeMillis() < restoredBy) Thread.sleep(50)
                 assertTrue("Swiping must cause an immediate repost, without a polling cycle", (primary()?.postTime ?: 0) > before)
@@ -200,7 +230,7 @@ class DualChipDeviceTest {
     }
 
     @Test fun encryptionAndLogoutRejectLateRenewalAndAccountIdReuse() {
-        val prefs = EncryptedPrefsManager(context)
+        val prefs = sharedPrefs()
         prefs.deleteAllCredentials()
         val old = Credential.ClaudeCredential("synthetic-old-access", "synthetic-old-refresh")
         prefs.saveCredential(AiService.CLAUDE, "device-test", "Claude", old)
@@ -219,7 +249,7 @@ class DualChipDeviceTest {
 
     @Test fun combinedChipKeepsBothQuotasVisibleAndLogoutCannotRepostIt() {
         dualNotificationsHaveIndependentIdentityAndPromotionRequests()
-        val prefs = EncryptedPrefsManager(context)
+        val prefs = sharedPrefs()
         val chips = ChipNotifications(context, prefs).apply { enabled = true }
         val openai = prefs.loadCredentialAccounts(AiService.CODEX).first()
         val claude = prefs.loadCredentialAccounts(AiService.CLAUDE).first()
@@ -236,8 +266,10 @@ class DualChipDeviceTest {
         // Also prove that a stale snapshot cannot restore a logged-out account notification.
         prefs.deleteAllCredentials()
         chips.publish(readings)
-        Thread.sleep(300)
-        assertTrue(context.getSystemService(NotificationManager::class.java).activeNotifications.none { (it.id == ChipNotifications.ACCOUNT_ID || it.id == ChipNotifications.CONTROL_ID) })
+        val manager = context.getSystemService(NotificationManager::class.java)
+        val removedBy = System.currentTimeMillis() + 5000
+        while (manager.activeNotifications.any { it.id == ChipNotifications.ACCOUNT_ID || it.id == ChipNotifications.CONTROL_ID } && System.currentTimeMillis() < removedBy) Thread.sleep(50)
+        assertTrue(manager.activeNotifications.none { it.id == ChipNotifications.ACCOUNT_ID || it.id == ChipNotifications.CONTROL_ID })
         // Recreate only synthetic readings for visual inspection of the fallback.
         prefs.saveCredential(AiService.CODEX, openai.id, "OpenAI demo", openai.credential)
         prefs.saveCredential(AiService.CLAUDE, claude.id, "Claude demo", claude.credential)
@@ -265,7 +297,7 @@ class DualChipDeviceTest {
     @Test fun dualNotificationsHaveIndependentIdentityAndPromotionRequests() {
         if (Build.VERSION.SDK_INT >= 33) InstrumentationRegistry.getInstrumentation().uiAutomation
             .grantRuntimePermission(context.packageName, Manifest.permission.POST_NOTIFICATIONS)
-        val prefs = EncryptedPrefsManager(context)
+        val prefs = sharedPrefs()
         prefs.deleteAllCredentials()
         prefs.saveCredential(AiService.CODEX, "proof-openai", "OpenAI demo", Credential.CodexCredential("synthetic", "synthetic"))
         prefs.saveCredential(AiService.CLAUDE, "proof-claude", "Claude demo", Credential.ClaudeCredential("synthetic", "synthetic"))
