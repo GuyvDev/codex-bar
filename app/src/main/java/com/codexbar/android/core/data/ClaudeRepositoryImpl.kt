@@ -92,7 +92,7 @@ class ClaudeRepositoryImpl @Inject constructor(
         } catch (e: IOException) {
             Result.Failure(AppError.NetworkError(e.message ?: "Network error", e))
         } catch (e: Exception) {
-            Result.Failure(AppError.ParseError(e.message ?: "Parse error", e))
+            Result.Failure(AppError.ParseError("Claude returned an unsupported usage response. Reconnect or retry later."))
         }
     }
 
@@ -172,13 +172,13 @@ class ClaudeRepositoryImpl @Inject constructor(
         }
 
         require(windows.isNotEmpty()) { "No usage windows returned" }
-        val extraUsage = response.extraUsage?.takeIf { it.isEnabled }?.let {
+        val extraUsage = response.extraUsage?.takeIf { it.isEnabled && it.monthlyLimit != null && it.usedCredits != null && it.utilization != null }?.let {
             ExtraUsage(
                 isEnabled = it.isEnabled,
-                monthlyLimit = it.monthlyLimit,
-                usedCredits = it.usedCredits,
-                utilization = it.utilization,
-                currency = it.currency
+                monthlyLimit = requireNotNull(it.monthlyLimit),
+                usedCredits = requireNotNull(it.usedCredits),
+                utilization = requireNotNull(it.utilization),
+                currency = it.currency ?: "USD"
             )
         }
 

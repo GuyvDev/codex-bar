@@ -19,6 +19,17 @@ import org.junit.runner.RunWith
 class DualChipDeviceTest {
     private val context: Context get() = InstrumentationRegistry.getInstrumentation().targetContext
 
+    @Test fun browserLoginModelSurvivesActivityRecreation() {
+        androidx.test.core.app.ActivityScenario.launch(PhoneAccountsActivity::class.java).use { scenario ->
+            var before: PhoneLoginViewModel? = null
+            scenario.onActivity { before = androidx.lifecycle.ViewModelProvider(it)[PhoneLoginViewModel::class.java] }
+            scenario.recreate()
+            scenario.onActivity {
+                assertSame(before, androidx.lifecycle.ViewModelProvider(it)[PhoneLoginViewModel::class.java])
+            }
+        }
+    }
+
     @Test fun encryptionAndLogoutRejectLateRenewalAndAccountIdReuse() {
         val prefs = EncryptedPrefsManager(context)
         prefs.deleteAllCredentials()

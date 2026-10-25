@@ -15,8 +15,8 @@ android {
         applicationId = "com.local.aquota"
         minSdk = 26
         targetSdk = 36
-        versionCode = 10001
-        versionName = "1.1.0-local"
+        versionCode = 10002
+        versionName = "1.1.1-local"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
@@ -122,6 +122,7 @@ dependencies {
     androidTestImplementation("androidx.test:runner:1.6.2")
     androidTestImplementation("androidx.test.ext:junit:1.2.1")
     testImplementation(libs.junit)
+    testImplementation("org.json:json:20240303")
     testImplementation(libs.kotlinx.coroutines.test)
     testImplementation(libs.turbine)
     testImplementation(libs.mockwebserver)

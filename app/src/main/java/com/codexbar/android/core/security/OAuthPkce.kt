@@ -37,6 +37,15 @@ class OAuthPkce {
         params["code"]?.takeIf { it.isNotBlank() && it.length <= 2048 }
     }.getOrNull()
 
+    /** Manual fallback still requires the exact state from this attempt. */
+    fun manualCode(input: String): String? {
+        val value = input.trim()
+        if (value.startsWith("http://")) return callbackCode(value)
+        val parts = value.split('#')
+        if (parts.size != 2 || parts[0].isBlank() || parts[0].length > 2048) return null
+        return parts[0].takeIf { MessageDigest.isEqual(state.toByteArray(), parts[1].toByteArray()) }
+    }
+
     companion object {
         const val CLAUDE_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
         const val REDIRECT_URI = "http://localhost:53692/callback"

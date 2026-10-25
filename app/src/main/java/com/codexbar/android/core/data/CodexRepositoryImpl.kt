@@ -80,7 +80,7 @@ class CodexRepositoryImpl @Inject constructor(
         } catch (e: IOException) {
             Result.Failure(AppError.NetworkError(e.message ?: "Network error", e))
         } catch (e: Exception) {
-            Result.Failure(AppError.ParseError(e.message ?: "Parse error", e))
+            Result.Failure(AppError.ParseError("OpenAI returned an unsupported usage response. Reconnect or retry later."))
         }
     }
 

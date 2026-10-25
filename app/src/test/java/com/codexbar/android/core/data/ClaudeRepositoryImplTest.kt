@@ -300,6 +300,27 @@ class ClaudeRepositoryImplTest {
         assertTrue(repository.fetchQuota() is Result.Failure)
     }
 
+    @Test fun `nullable disabled extra usage does not break valid quota`() = runTest {
+        mockWebServer.enqueue(MockResponse().setBody("""{
+            "five_hour":{"utilization":23,"resets_at":null},
+            "seven_day":null,
+            "extra_usage":{"is_enabled":false,"monthly_limit":null,"used_credits":null,"utilization":null,"currency":null}
+        }"""))
+        val result = repository.fetchQuota()
+        assertTrue(result is Result.Success)
+        val quota = (result as Result.Success).value
+        assertEquals(0.23, quota.windows.first().utilization, 0.0001)
+        assertTrue(quota.extraUsage == null)
+    }
+
+    @Test fun `invalid usage JSON produces safe diagnostic without server body`() = runTest {
+        mockWebServer.enqueue(MockResponse().setBody("<html>private-server-response-marker</html>"))
+        val result = repository.fetchQuota() as Result.Failure
+        val error = result.error as AppError.ParseError
+        assertTrue(!error.message.contains("private-server-response-marker"))
+        assertTrue(!error.message.contains("offset"))
+    }
+
     private fun testAccount(credential: Credential.ClaudeCredential): CredentialAccount {
         return CredentialAccount(
             id = "claude-test",

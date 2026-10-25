@@ -15,12 +15,19 @@ import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONObject
 
 /** Only fixed provider HTTPS origins. Error bodies, tokens and callback URLs are never logged. */
-class PhoneLoginClient {
-    private val client = OkHttpClient.Builder()
+class PhoneLoginClient(
+    private val client: OkHttpClient = OkHttpClient.Builder()
         .followRedirects(false).followSslRedirects(false).retryOnConnectionFailure(false)
         .callTimeout(30, TimeUnit.SECONDS).build()
+) {
     @Volatile private var callback: ServerSocket? = null
     @Volatile private var cancelled = false
+    @Volatile private var activePkce: OAuthPkce? = null
+    private val manualCodes = java.util.concurrent.ArrayBlockingQueue<String>(1)
+    fun submitClaudeCallback(input: String): Boolean {
+        val code = activePkce?.manualCode(input) ?: return false
+        return !cancelled && manualCodes.offer(code)
+    }
 
     fun cancel() { cancelled = true; runCatching { callback?.close() }; client.dispatcher.cancelAll() }
 
@@ -28,21 +35,31 @@ class PhoneLoginClient {
         Request.Builder().url(url).post(data.toString().toRequestBody("application/json".toMediaType())).build()
     )
 
+    private fun stage(request: Request): String = when (request.url.encodedPath) {
+        "/api/accounts/deviceauth/usercode" -> "OpenAI device code"
+        "/api/accounts/deviceauth/token" -> "OpenAI device confirmation"
+        "/oauth/token" -> "OpenAI token exchange"
+        else -> "Claude token exchange"
+    }
+
     private fun execute(request: Request): JSONObject {
         check(!cancelled) { "Sign-in cancelled" }
         return client.newCall(request.newBuilder().header("Accept", "application/json").build()).execute().use {
-            if (!it.isSuccessful) throw LoginHttpError(it.code)
+            if (!it.isSuccessful) throw LoginHttpError(it.code, stage(request))
             val body = it.body ?: error("Empty authorization response")
             require(body.contentLength() <= 1_048_576) { "Authorization response too large" }
             val source = body.source()
             source.request(1_048_577)
             require(source.buffer.size <= 1_048_576) { "Authorization response too large" }
-            JSONObject(source.readUtf8())
+            val type = body.contentType()
+            if (type?.subtype?.contains("json") != true) throw LoginResponseError(stage(request))
+            try { JSONObject(source.readUtf8()) } catch (_: org.json.JSONException) { throw LoginResponseError(stage(request)) }
         }
     }
 
     fun claude(openBrowser: (String) -> Unit): Credential.ClaudeCredential {
         val pkce = OAuthPkce()
+        activePkce = pkce
         val socket = ServerSocket(53692, 4, InetAddress.getByName("127.0.0.1"))
         callback = socket
         socket.soTimeout = 1000
@@ -50,9 +67,9 @@ class PhoneLoginClient {
         try {
             openBrowser(pkce.authorizeUrl())
             while (!cancelled && System.nanoTime() < deadline) {
-                val incoming = try { socket.accept() } catch (_: SocketTimeoutException) { continue }
-                var code: String? = null
-                try { incoming.use { peer ->
+                var code: String? = manualCodes.poll()
+                val incoming = if (code == null) try { socket.accept() } catch (_: SocketTimeoutException) { continue } else null
+                try { incoming?.use { peer ->
                     peer.soTimeout = 3000
                     val firstLine = StringBuilder()
                     while (firstLine.length <= 4096) {
@@ -84,7 +101,7 @@ class PhoneLoginClient {
                 }
             }
             error("Sign-in expired or cancelled; try again")
-        } finally { socket.close(); callback = null }
+        } finally { socket.close(); callback = null; activePkce = null; manualCodes.clear() }
     }
 
     fun codex(showCode: (String, String) -> Unit): Credential.CodexCredential {
@@ -120,4 +137,10 @@ class PhoneLoginClient {
     }
 }
 
-class LoginHttpError(val status: Int) : Exception("Provider rejected sign-in (HTTP $status)")
+class LoginHttpError(val status: Int, val stage: String) : Exception("Provider rejected sign-in (HTTP $status)")
+
+class LoginResponseError(val stage: String) : Exception("Provider sign-in response was not a JSON object")
+
+class PhoneLoginClientFactory @javax.inject.Inject constructor() {
+    fun create(): PhoneLoginClient = PhoneLoginClient()
+}
