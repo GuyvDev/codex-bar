@@ -2,7 +2,7 @@
 
 Base: https://github.com/Hephaestus-DevKit/codex-bar at a618d5897509b0da3f9adc21ef85f67afe045bf5.
 Local app ID: com.local.aquota (debug: com.local.aquota.debug).
-Version: 1.1.0-local (10001). Min API 26; compile/target API 36.
+Version: 1.1.4-local (10005). Min API 26; compile/target API 36.
 
 Requirements: JDK 21, Android SDK platform 36/build-tools 36.0.0, Internet access for Gradle dependencies. Set JAVA_HOME and ANDROID_HOME for your machine.
 
@@ -24,3 +24,5 @@ Run dualNotificationsHaveIndependentIdentityAndPromotionRequests separately for 
 User-started foreground monitoring polls about once per minute, subject to Android scheduling and provider limits. Two notifications request promotion; the OS controls actual chip visibility, layout and text truncation. See the accompanying Hebrew security report and device results for tested behavior and limitations.
 
 The original MIT license and attribution remain in LICENSE.
+
+Quota notifications have only a provider title and Stop action, without body or expanded text. The existing channel defaults to LOW importance, no sound, vibration, lights or badge. LOW is the lowest importance that permits native chip promotion; MIN/minimized hides the chip. Android controls notification ordering and may prioritize promoted ongoing notifications; the app cannot pin a row to the bottom. Existing user channel preferences are preserved.

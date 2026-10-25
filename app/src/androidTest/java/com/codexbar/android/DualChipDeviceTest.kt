@@ -50,7 +50,9 @@ class DualChipDeviceTest {
                 waitForRow()
                 assertEquals(1, ownRows().size)
                 val initial = ownRows().single().notification
-                assertTrue(initial.extras.getCharSequence(Notification.EXTRA_TITLE).toString().contains("80/65"))
+                assertEquals("OpenAI / Claude", initial.extras.getCharSequence(Notification.EXTRA_TITLE).toString())
+                assertNull(initial.extras.getCharSequence(Notification.EXTRA_TEXT))
+                assertNull(initial.extras.getCharSequence(Notification.EXTRA_BIG_TEXT))
                 assertEquals(1, initial.actions.size)
                 assertEquals("Stop", initial.actions.single().title.toString())
                 restore = initial.deleteIntent
@@ -277,6 +279,12 @@ class DualChipDeviceTest {
         }
         for (reading in readings) {
             val notification = chips.accountNotification(reading)
+            val channel = context.getSystemService(NotificationManager::class.java).getNotificationChannel(ChipNotifications.CHANNEL)
+            assertEquals(NotificationManager.IMPORTANCE_LOW, channel.importance)
+            assertNull(channel.sound)
+            assertFalse(channel.shouldVibrate())
+            assertNull(notification.extras.getCharSequence(Notification.EXTRA_TEXT))
+            assertNull(notification.extras.getCharSequence(Notification.EXTRA_BIG_TEXT))
             assertNull(notification.group)
             assertEquals(Notification.VISIBILITY_PRIVATE, notification.visibility)
             if (Build.VERSION.SDK_INT >= 36) {
@@ -290,8 +298,8 @@ class DualChipDeviceTest {
         val active = manager.activeNotifications.filter { (it.id == ChipNotifications.ACCOUNT_ID || it.id == ChipNotifications.CONTROL_ID) }
         assertEquals(2, active.size)
         assertEquals(2, active.map { it.tag to it.id }.distinct().size)
-        assertTrue(active.any { it.notification.extras.getCharSequence(Notification.EXTRA_TITLE).toString().contains("80%") })
-        assertTrue(active.any { it.notification.extras.getCharSequence(Notification.EXTRA_TITLE).toString().contains("65%") })
+        assertTrue(active.any { it.notification.extras.getCharSequence(Notification.EXTRA_TITLE).toString() == "OpenAI" })
+        assertTrue(active.any { it.notification.extras.getCharSequence(Notification.EXTRA_TITLE).toString() == "Claude" })
         // Leave synthetic notifications for an external screenshot; no real account is used.
     }
 }

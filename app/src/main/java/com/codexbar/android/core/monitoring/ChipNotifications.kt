@@ -11,12 +11,9 @@ import android.content.pm.PackageManager
 import android.graphics.drawable.Icon
 import android.os.Build
 import com.codexbar.android.PhoneAccountsActivity
-import com.codexbar.android.MainActivity
 import com.codexbar.android.R
 import com.codexbar.android.core.domain.model.AiService
 import dagger.hilt.android.qualifiers.ApplicationContext
-import java.time.Duration
-import java.time.Instant
 import javax.inject.Inject
 import javax.inject.Singleton
 
@@ -30,6 +27,9 @@ class ChipNotifications @Inject constructor(@ApplicationContext private val cont
     init {
         manager.createNotificationChannel(NotificationChannel(CHANNEL, "Account quota chips", NotificationManager.IMPORTANCE_LOW).apply {
             description = "Silent quota notification; Android requires it for the status-bar chip"
+            setSound(null, null)
+            enableVibration(false)
+            enableLights(false)
             setShowBadge(false)
             lockscreenVisibility = Notification.VISIBILITY_PRIVATE
         })
@@ -47,8 +47,8 @@ class ChipNotifications @Inject constructor(@ApplicationContext private val cont
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)).build()
 
     fun controller(): Notification = Notification.Builder(context, CHANNEL)
-        .setSmallIcon(R.drawable.ic_quota).setContentTitle("Live quota monitoring")
-        .setContentText("OpenAI + Claude · every 60 seconds while Android permits · tap for controls")
+        .setSmallIcon(R.drawable.ic_quota).setContentTitle("AI Quota")
+        .setShowWhen(false)
         .setContentIntent(openApp()).setOngoing(true).setOnlyAlertOnce(true)
         .setDeleteIntent(restoreAfterSwipe())
         .setVisibility(Notification.VISIBILITY_PRIVATE)
@@ -87,14 +87,8 @@ class ChipNotifications @Inject constructor(@ApplicationContext private val cont
     fun combinedNotification(openai: AccountReading, claude: AccountReading): Notification {
         val short = QuotaChip.pairText(openai.quota, openai.error != null, claude.quota, claude.error != null)
         val first = accountNotification(openai)
-        val second = accountNotification(claude)
-        val detail = "OpenAI first / Claude second · remaining quota\n" +
-            "${first.extras.getCharSequence(Notification.EXTRA_TITLE)}\n${first.extras.getCharSequence(Notification.EXTRA_BIG_TEXT)}\n\n" +
-            "${second.extras.getCharSequence(Notification.EXTRA_TITLE)}\n${second.extras.getCharSequence(Notification.EXTRA_BIG_TEXT)}"
         val builder = Notification.Builder.recoverBuilder(context, first)
-            .setContentTitle("OpenAI / Claude · $short remaining")
-            .setContentText("OpenAI first / Claude second · ? means missing, old or failed")
-            .setStyle(Notification.BigTextStyle().bigText(detail))
+            .setContentTitle("OpenAI / Claude")
         if (Build.VERSION.SDK_INT >= 36) builder.setShortCriticalText(short)
         return builder.build()
     }
@@ -104,19 +98,13 @@ class ChipNotifications @Inject constructor(@ApplicationContext private val cont
         val quota = reading.quota
         val short = QuotaChip.shortText(quota, reading.error != null)
         val provider = if (account.service == AiService.CODEX) "OpenAI" else "Claude"
-        val title = "$provider · ${account.label} · $short remaining"
-        val age = quota?.let { Duration.between(it.fetchedAt, Instant.now()).seconds.coerceAtLeast(0) }
-        val detail = quota?.windows?.joinToString(" · ") {
-            val remaining = ((1 - it.utilization) * 100).toInt().coerceIn(0, 100)
-            "${it.label}: $remaining% remaining" + (it.resetsAt?.let { reset -> " · resets $reset" } ?: "")
-        } ?: "Waiting for first successful reading"
-        val status = reading.error ?: "Last successful update ${age ?: 0}s ago"
         val icon = if (account.service == AiService.CODEX) R.drawable.ic_service_codex else R.drawable.ic_service_claude
         val publicVersion = Notification.Builder(context, CHANNEL).setSmallIcon(icon)
-            .setContentTitle("AI quota monitor").setContentText("Unlock to see account usage").build()
+            .setContentTitle("AI Quota").setShowWhen(false).build()
         val builder = Notification.Builder(context, CHANNEL)
-            .setSmallIcon(icon).setContentTitle(title).setContentText(status)
-            .setStyle(Notification.BigTextStyle().bigText("$detail\n$status\n~ means an old or failed reading"))
+            // A nonempty title is required for native chip promotion. Keep the body
+            // and expanded text absent; detailed quotas remain in the dashboard.
+            .setSmallIcon(icon).setContentTitle(provider)
             .setContentIntent(openApp()).setOngoing(true).setOnlyAlertOnce(true).setShowWhen(false)
             .setDeleteIntent(restoreAfterSwipe()).addAction(stopAction())
             .setVisibility(Notification.VISIBILITY_PRIVATE).setPublicVersion(publicVersion)

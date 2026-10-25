@@ -15,8 +15,8 @@ android {
         applicationId = "com.local.aquota"
         minSdk = 26
         targetSdk = 36
-        versionCode = 10004
-        versionName = "1.1.3-local"
+        versionCode = 10005
+        versionName = "1.1.4-local"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
